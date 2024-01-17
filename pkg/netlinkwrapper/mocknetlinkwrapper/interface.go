@@ -138,6 +138,21 @@ func (mr *MockInterfaceMockRecorder) LinkDel(link interface{}) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "LinkDel", reflect.TypeOf((*MockInterface)(nil).LinkDel), link)
 }
 
+// LinkList mocks base method.
+func (m *MockInterface) LinkList() ([]netlink.Link, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "LinkList")
+	ret0, _ := ret[0].([]netlink.Link)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// LinkList indicates an expected call of LinkList.
+func (mr *MockInterfaceMockRecorder) LinkList() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "LinkList", reflect.TypeOf((*MockInterface)(nil).LinkList))
+}
+
 // LinkSetAlias mocks base method.
 func (m *MockInterface) LinkSetAlias(link netlink.Link, name string) error {
 	m.ctrl.T.Helper()
@@ -237,6 +252,21 @@ func (mr *MockInterfaceMockRecorder) RouteList(link, family interface{}) *gomock
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RouteList", reflect.TypeOf((*MockInterface)(nil).RouteList), link, family)
 }
 
+// RouteListFiltered mocks base method.
+func (m *MockInterface) RouteListFiltered(family int, filter *netlink.Route, filterMask uint64) ([]netlink.Route, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RouteListFiltered", family, filter, filterMask)
+	ret0, _ := ret[0].([]netlink.Route)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// RouteListFiltered indicates an expected call of RouteListFiltered.
+func (mr *MockInterfaceMockRecorder) RouteListFiltered(family, filter, filterMask interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RouteListFiltered", reflect.TypeOf((*MockInterface)(nil).RouteListFiltered), family, filter, filterMask)
+}
+
 // RouteReplace mocks base method.
 func (m *MockInterface) RouteReplace(route *netlink.Route) error {
 	m.ctrl.T.Helper()
@@ -263,4 +293,33 @@ func (m *MockInterface) RuleAdd(rule *netlink.Rule) error {
 func (mr *MockInterfaceMockRecorder) RuleAdd(rule interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RuleAdd", reflect.TypeOf((*MockInterface)(nil).RuleAdd), rule)
+}
+
+// RuleDel mocks base method.
+func (m *MockInterface) RuleDel(rule *netlink.Rule) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RuleDel", rule)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// RuleDel indicates an expected call of RuleDel.
+func (mr *MockInterfaceMockRecorder) RuleDel(rule interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RuleDel", reflect.TypeOf((*MockInterface)(nil).RuleDel), rule)
+}
+
+// RuleList mocks base method.
+func (m *MockInterface) RuleList(family int) ([]netlink.Rule, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RuleList", family)
+	ret0, _ := ret[0].([]netlink.Rule)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// RuleList indicates an expected call of RuleList.
+func (mr *MockInterfaceMockRecorder) RuleList(family interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RuleList", reflect.TypeOf((*MockInterface)(nil).RuleList), family)
 }

@@ -30,7 +30,7 @@ import (
 	"github.com/Azure/kube-egress-gateway/pkg/consts"
 	"github.com/Azure/kube-egress-gateway/pkg/imds"
 	"github.com/Azure/kube-egress-gateway/pkg/netlinkwrapper/mocknetlinkwrapper"
-	"github.com/Azure/kube-egress-gateway/pkg/netnswrapper/mocknetnswrapper"
+	"github.com/Azure/kube-egress-gateway/pkg/utils/to"
 	"github.com/Azure/kube-egress-gateway/pkg/wgctrlwrapper/mockwgctrlwrapper"
 )
 
@@ -57,7 +57,6 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 		cl := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithRuntimeObjects(objects...).Build()
 		r = &PodEndpointReconciler{Client: cl}
 		r.Netlink = mocknetlinkwrapper.NewMockInterface(mctrl)
-		r.NetNS = mocknetnswrapper.NewMockInterface(mctrl)
 		r.WgCtrl = mockwgctrlwrapper.NewMockInterface(mctrl)
 		mclient = mockwgctrlwrapper.NewMockClient(mctrl)
 	}
@@ -106,7 +105,7 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 			gwConfig = getTestGwConfig()
 			nodeMeta = &imds.InstanceMetadata{
 				Compute: &imds.ComputeMetadata{
-					VMScaleSetName:    vmssName + "a",
+					VMScaleSetName:    vmssName,
 					ResourceGroupName: vmssRG,
 				},
 			}
@@ -124,10 +123,23 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 
 		When("gwConfig does not apply to the node", func() {
 			It("should not do anything", func() {
+				nodeMeta.Compute.VMScaleSetName = vmssName + "a"
 				getTestReconciler(podEndpoint, gwConfig)
 				res, reconcileErr = r.Reconcile(context.TODO(), req)
 
 				Expect(reconcileErr).To(BeNil())
+				Expect(res).To(Equal(ctrl.Result{}))
+			})
+		})
+
+		When("gwConfig is being deleted", func() {
+			It("should report error", func() {
+				gwConfig.DeletionTimestamp = to.Ptr(metav1.Now())
+				gwConfig.Finalizers = []string{consts.SGCFinalizerName}
+				getTestReconciler(podEndpoint, gwConfig)
+				res, reconcileErr = r.Reconcile(context.TODO(), req)
+
+				Expect(reconcileErr).To(HaveOccurred())
 				Expect(res).To(Equal(ctrl.Result{}))
 			})
 		})
@@ -159,21 +171,9 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 			os.Setenv(consts.NodeNameEnvKey, "")
 		})
 
-		It("should report error when gateway namespace is not found", func() {
-			mns := r.NetNS.(*mocknetnswrapper.MockInterface)
-			gomock.InOrder(
-				mns.EXPECT().GetNS(nsName).Return(nil, os.ErrNotExist),
-			)
-			_, reconcileErr = r.Reconcile(context.TODO(), req)
-			Expect(errors.Unwrap(reconcileErr)).To(Equal(os.ErrNotExist))
-		})
-
 		It("should report error when failed to create wgCtrl client", func() {
-			mns := r.NetNS.(*mocknetnswrapper.MockInterface)
 			mwg := r.WgCtrl.(*mockwgctrlwrapper.MockInterface)
-			gwns := &mocknetnswrapper.MockNetNS{Name: nsName}
 			gomock.InOrder(
-				mns.EXPECT().GetNS(nsName).Return(gwns, nil),
 				mwg.EXPECT().New().Return(nil, fmt.Errorf("failed")),
 			)
 			_, reconcileErr = r.Reconcile(context.TODO(), req)
@@ -181,9 +181,7 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 		})
 
 		It("should report error when failed to configure wireguard device", func() {
-			mns := r.NetNS.(*mocknetnswrapper.MockInterface)
 			mwg := r.WgCtrl.(*mockwgctrlwrapper.MockInterface)
-			gwns := &mocknetnswrapper.MockNetNS{Name: nsName}
 			pk, _ := wgtypes.ParseKey(pubK)
 			config := wgtypes.Config{
 				Peers: []wgtypes.PeerConfig{
@@ -197,9 +195,8 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 				},
 			}
 			gomock.InOrder(
-				mns.EXPECT().GetNS(nsName).Return(gwns, nil),
 				mwg.EXPECT().New().Return(mclient, nil),
-				mclient.EXPECT().ConfigureDevice("wg0", config).Return(fmt.Errorf("failed")),
+				mclient.EXPECT().ConfigureDevice("wg6000", config).Return(fmt.Errorf("failed")),
 				mclient.EXPECT().Close().Return(nil),
 			)
 			_, reconcileErr = r.Reconcile(context.TODO(), req)
@@ -208,9 +205,7 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 
 		Context("test adding peer route", func() {
 			BeforeEach(func() {
-				mns := r.NetNS.(*mocknetnswrapper.MockInterface)
 				mwg := r.WgCtrl.(*mockwgctrlwrapper.MockInterface)
-				gwns := &mocknetnswrapper.MockNetNS{Name: nsName}
 				pk, _ := wgtypes.ParseKey(pubK)
 				config := wgtypes.Config{
 					Peers: []wgtypes.PeerConfig{
@@ -224,9 +219,8 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 					},
 				}
 				gomock.InOrder(
-					mns.EXPECT().GetNS(nsName).Return(gwns, nil),
 					mwg.EXPECT().New().Return(mclient, nil),
-					mclient.EXPECT().ConfigureDevice("wg0", config).Return(nil),
+					mclient.EXPECT().ConfigureDevice("wg6000", config).Return(nil),
 					mclient.EXPECT().Close().Return(nil),
 				)
 			})
@@ -234,7 +228,7 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 			It("should report error if failed to get wireguard link", func() {
 				mnl := r.Netlink.(*mocknetlinkwrapper.MockInterface)
 				wg0 := &netlink.Wireguard{}
-				mnl.EXPECT().LinkByName("wg0").Return(wg0, fmt.Errorf("failed"))
+				mnl.EXPECT().LinkByName("wg6000").Return(wg0, fmt.Errorf("failed"))
 				_, reconcileErr = r.Reconcile(context.TODO(), req)
 				Expect(errors.Unwrap(errors.Unwrap(reconcileErr))).To(Equal(fmt.Errorf("failed")))
 			})
@@ -243,8 +237,8 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 				mnl := r.Netlink.(*mocknetlinkwrapper.MockInterface)
 				wg0 := &netlink.Wireguard{}
 				gomock.InOrder(
-					mnl.EXPECT().LinkByName("wg0").Return(wg0, nil),
-					mnl.EXPECT().RouteReplace(&netlink.Route{LinkIndex: 0, Scope: netlink.SCOPE_LINK, Dst: getIPNet(podIPAddrNet)}).Return(fmt.Errorf("failed")),
+					mnl.EXPECT().LinkByName("wg6000").Return(wg0, nil),
+					mnl.EXPECT().RouteReplace(&netlink.Route{LinkIndex: 0, Scope: netlink.SCOPE_LINK, Dst: getIPNet(podIPAddrNet), Table: 0x8000}).Return(fmt.Errorf("failed")),
 				)
 				_, reconcileErr = r.Reconcile(context.TODO(), req)
 				Expect(errors.Unwrap(errors.Unwrap(reconcileErr))).To(Equal(fmt.Errorf("failed")))
@@ -254,8 +248,8 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 				mnl := r.Netlink.(*mocknetlinkwrapper.MockInterface)
 				wg0 := &netlink.Wireguard{}
 				gomock.InOrder(
-					mnl.EXPECT().LinkByName("wg0").Return(wg0, nil),
-					mnl.EXPECT().RouteReplace(&netlink.Route{LinkIndex: 0, Scope: netlink.SCOPE_LINK, Dst: getIPNet(podIPAddrNet)}).Return(nil),
+					mnl.EXPECT().LinkByName("wg6000").Return(wg0, nil),
+					mnl.EXPECT().RouteReplace(&netlink.Route{LinkIndex: 0, Scope: netlink.SCOPE_LINK, Dst: getIPNet(podIPAddrNet), Table: 0x8000}).Return(nil),
 				)
 				_, reconcileErr = r.Reconcile(context.TODO(), req)
 				Expect(reconcileErr).To(BeNil())
@@ -264,9 +258,9 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 				Expect(err).To(BeNil())
 				Expect(gwStatus.Spec.ReadyPeerConfigurations).To(Equal([]egressgatewayv1alpha1.PeerConfiguration{
 					{
-						PublicKey:   pubK,
-						NetnsName:   nsName,
-						PodEndpoint: fmt.Sprintf("%s/%s", testNamespace, testName),
+						PublicKey:     pubK,
+						InterfaceName: "wg6000",
+						PodEndpoint:   fmt.Sprintf("%s/%s", testNamespace, testName),
 					},
 				}))
 			})
@@ -276,12 +270,12 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 	Context("Test updating gateway node status", func() {
 		peerConfigs := []egressgatewayv1alpha1.PeerConfiguration{
 			{
-				PublicKey: "pubk1",
-				NetnsName: "ns1",
+				PublicKey:     "pubk1",
+				InterfaceName: "wg1",
 			},
 			{
-				PublicKey: "pubk2",
-				NetnsName: "ns2",
+				PublicKey:     "pubk2",
+				InterfaceName: "wg2",
 			},
 		}
 
@@ -314,12 +308,12 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 				Spec: egressgatewayv1alpha1.GatewayStatusSpec{
 					ReadyPeerConfigurations: []egressgatewayv1alpha1.PeerConfiguration{
 						{
-							PublicKey: "pubk1",
-							NetnsName: "ns1",
+							PublicKey:     "pubk1",
+							InterfaceName: "wg1",
 						},
 						{
-							PublicKey: "pubk3",
-							NetnsName: "ns3",
+							PublicKey:     "pubk3",
+							InterfaceName: "wg3",
 						},
 					},
 				},
@@ -347,12 +341,12 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 				Spec: egressgatewayv1alpha1.GatewayStatusSpec{
 					ReadyPeerConfigurations: []egressgatewayv1alpha1.PeerConfiguration{
 						{
-							PublicKey: "pubk1",
-							NetnsName: "ns1",
+							PublicKey:     "pubk1",
+							InterfaceName: "wg1",
 						},
 						{
-							PublicKey: "pubk3",
-							NetnsName: "ns3",
+							PublicKey:     "pubk3",
+							InterfaceName: "wg3",
 						},
 					},
 				},
@@ -401,19 +395,17 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 				Spec: egressgatewayv1alpha1.GatewayStatusSpec{
 					ReadyPeerConfigurations: []egressgatewayv1alpha1.PeerConfiguration{
 						{
-							PublicKey: pubK,
-							NetnsName: "ns1",
+							PublicKey:     pubK,
+							InterfaceName: "wg1",
 						},
 					},
 				},
 			}
 			gwConfig = getTestGwConfig()
 			getTestReconciler(gwConfig, gwStatus)
-			mns := r.NetNS.(*mocknetnswrapper.MockInterface)
 			mwg := r.WgCtrl.(*mockwgctrlwrapper.MockInterface)
 			mnl := r.Netlink.(*mocknetlinkwrapper.MockInterface)
 			wg0 := &netlink.Wireguard{}
-			gwns := &mocknetnswrapper.MockNetNS{Name: nsName}
 			pk, _ := wgtypes.ParseKey(pubK)
 			device := &wgtypes.Device{
 				Peers: []wgtypes.Peer{
@@ -435,13 +427,12 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 				},
 			}
 			gomock.InOrder(
-				mns.EXPECT().GetNS(nsName).Return(gwns, nil),
 				mwg.EXPECT().New().Return(mclient, nil),
-				mclient.EXPECT().Device("wg0").Return(device, nil),
-				mnl.EXPECT().LinkByName("wg0").Return(wg0, nil),
-				mnl.EXPECT().RouteList(wg0, netlink.FAMILY_ALL).Return([]netlink.Route{{Dst: getIPNet("10.0.0.1/32")}}, nil),
-				mnl.EXPECT().RouteDel(&netlink.Route{Dst: getIPNet("10.0.0.1/32")}).Return(nil),
-				mclient.EXPECT().ConfigureDevice("wg0", config).Return(nil),
+				mclient.EXPECT().Device("wg6000").Return(device, nil),
+				mnl.EXPECT().LinkByName("wg6000").Return(wg0, nil),
+				mnl.EXPECT().RouteDel(&netlink.Route{LinkIndex: 0, Scope: netlink.SCOPE_LINK, Dst: getIPNet("10.0.0.1/32"), Table: 0x8000}).Return(nil),
+				mnl.EXPECT().RouteDel(&netlink.Route{LinkIndex: 0, Scope: netlink.SCOPE_LINK, Dst: getIPNet("10.0.0.2/32"), Table: 0x8000}).Return(nil),
+				mclient.EXPECT().ConfigureDevice("wg6000", config).Return(nil),
 				mclient.EXPECT().Close().Return(nil),
 			)
 			_, reconcileErr = r.Reconcile(context.TODO(), req)
@@ -456,9 +447,7 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 			podEndpoint.Name = testName + "a"
 			gwConfig = getTestGwConfig()
 			getTestReconciler(podEndpoint, gwConfig)
-			mns := r.NetNS.(*mocknetnswrapper.MockInterface)
 			mwg := r.WgCtrl.(*mockwgctrlwrapper.MockInterface)
-			gwns := &mocknetnswrapper.MockNetNS{Name: nsName}
 			pk, _ := wgtypes.ParseKey(pubK)
 			device := &wgtypes.Device{
 				Peers: []wgtypes.Peer{
@@ -471,16 +460,15 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 				},
 			}
 			gomock.InOrder(
-				mns.EXPECT().GetNS(nsName).Return(gwns, nil),
 				mwg.EXPECT().New().Return(mclient, nil),
-				mclient.EXPECT().Device("wg0").Return(device, nil),
+				mclient.EXPECT().Device("wg6000").Return(device, nil),
 				mclient.EXPECT().Close().Return(nil),
 			)
 			_, reconcileErr = r.Reconcile(context.TODO(), req)
 			Expect(reconcileErr).To(BeNil())
 		})
 
-		It("should handle multiple gateway namespaces properly", func() {
+		It("should handle multiple gateway configurations properly", func() {
 			objects := []runtime.Object{
 				getTestGwConfig(),
 				&egressgatewayv1alpha1.StaticGatewayConfiguration{
@@ -496,7 +484,20 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 							PublicIpPrefixSize: 31,
 						},
 					},
-					Status: getTestGwConfigStatus(),
+					Status: egressgatewayv1alpha1.StaticGatewayConfigurationStatus{
+						EgressIpPrefix: "1.2.3.4/31",
+						GatewayServerProfile: egressgatewayv1alpha1.GatewayServerProfile{
+							Ip:        ilbIP,
+							Port:      6001,
+							PublicKey: pubK,
+							PrivateKeySecretRef: &corev1.ObjectReference{
+								APIVersion: "v1",
+								Kind:       "Secret",
+								Name:       testName,
+								Namespace:  testSecretNamespace,
+							},
+						},
+					},
 				},
 				&egressgatewayv1alpha1.PodEndpoint{
 					ObjectMeta: metav1.ObjectMeta{
@@ -511,11 +512,9 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 				},
 			}
 			getTestReconciler(objects...)
-			mns := r.NetNS.(*mocknetnswrapper.MockInterface)
 			mwg := r.WgCtrl.(*mockwgctrlwrapper.MockInterface)
 			mnl := r.Netlink.(*mocknetlinkwrapper.MockInterface)
 			wg0 := &netlink.Wireguard{}
-			gwns := &mocknetnswrapper.MockNetNS{Name: nsName}
 			pk, _ := wgtypes.ParseKey(pubK)
 			pk2, _ := wgtypes.ParseKey(pubK2)
 			device := &wgtypes.Device{
@@ -542,17 +541,15 @@ var _ = Describe("Daemon PodEndpoint controller unit tests", func() {
 					},
 				},
 			}
-			// 1st gateway namespace, delete one peer and keey one peer
-			mns.EXPECT().GetNS(nsName).Return(gwns, nil)
+			// 1st gateway config, delete one peer and keey one peer
 			mwg.EXPECT().New().Return(mclient, nil)
-			mclient.EXPECT().Device("wg0").Return(device, nil)
-			mnl.EXPECT().LinkByName("wg0").Return(wg0, nil)
-			mnl.EXPECT().RouteList(wg0, netlink.FAMILY_ALL).Return([]netlink.Route{{Dst: getIPNet("10.0.0.1/32")}, {Dst: getIPNet("10.0.0.2/32")}}, nil)
-			mnl.EXPECT().RouteDel(&netlink.Route{Dst: getIPNet("10.0.0.2/32")}).Return(nil)
-			mclient.EXPECT().ConfigureDevice("wg0", config).Return(nil)
+			mclient.EXPECT().Device("wg6000").Return(device, nil)
+			mnl.EXPECT().LinkByName("wg6000").Return(wg0, nil)
+			mnl.EXPECT().RouteDel(&netlink.Route{LinkIndex: 0, Scope: netlink.SCOPE_LINK, Dst: getIPNet("10.0.0.2/32"), Table: 0x8000}).Return(nil)
+			mclient.EXPECT().ConfigureDevice("wg6000", config).Return(nil)
 			mclient.EXPECT().Close().Return(nil)
-			// 2nd gateway namespace, return error, should not block
-			mns.EXPECT().GetNS("gw-1234567891-10_0_0_4").Return(nil, fmt.Errorf("failed"))
+			// 2nd gateway config, return error, should not block
+			mclient.EXPECT().Device("wg6001").Return(nil, fmt.Errorf("failed"))
 			_, reconcileErr = r.Reconcile(context.TODO(), req)
 			Expect(reconcileErr).To(BeNil())
 		})

@@ -4,6 +4,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -12,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
@@ -20,6 +20,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	utiliptables "k8s.io/kubernetes/pkg/util/iptables"
+	utilexec "k8s.io/utils/exec"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -34,9 +36,7 @@ import (
 	"github.com/Azure/kube-egress-gateway/pkg/consts"
 	"github.com/Azure/kube-egress-gateway/pkg/healthprobe"
 	"github.com/Azure/kube-egress-gateway/pkg/imds"
-	"github.com/Azure/kube-egress-gateway/pkg/iptableswrapper"
 	"github.com/Azure/kube-egress-gateway/pkg/netlinkwrapper"
-	"github.com/Azure/kube-egress-gateway/pkg/netnswrapper"
 	"github.com/Azure/kube-egress-gateway/pkg/utils/to"
 	"github.com/Azure/kube-egress-gateway/pkg/wgctrlwrapper"
 )
@@ -50,8 +50,7 @@ type StaticGatewayConfigurationReconciler struct {
 	TickerEvents  chan event.GenericEvent
 	LBProbeServer *healthprobe.LBProbeServer
 	Netlink       netlinkwrapper.Interface
-	NetNS         netnswrapper.Interface
-	IPTables      iptableswrapper.Interface
+	IPTables      utiliptables.Interface
 	WgCtrl        wgctrlwrapper.Interface
 }
 
@@ -100,8 +99,9 @@ func (r *StaticGatewayConfigurationReconciler) Reconcile(ctx context.Context, re
 	// Got an event from cleanup ticker
 	if req.NamespacedName.Namespace == "" && req.NamespacedName.Name == "" {
 		if err := r.cleanUp(ctx); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to clean up orphaned network namespaces: %w", err)
+			return ctrl.Result{}, fmt.Errorf("failed to clean up orphaned network configurations: %w", err)
 		}
+		return ctrl.Result{}, nil
 	}
 
 	// Fetch the StaticGatewayConfiguration instance.
@@ -126,19 +126,20 @@ func (r *StaticGatewayConfigurationReconciler) Reconcile(ctx context.Context, re
 	}
 
 	if !gwConfig.ObjectMeta.DeletionTimestamp.IsZero() {
-		// ignore: network namespace would be removed by regular cleanup
+		if err := r.cleanUp(ctx); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to clean up deleted StaticGatewayConfiguration %s/%s: %w", gwConfig.Namespace, gwConfig.Name, err)
+		}
 		return ctrl.Result{}, nil
 	}
 
-	// Reconcile gateway namespace
+	// Reconcile gateway network configurations
 	return ctrl.Result{}, r.reconcile(ctx, gwConfig)
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *StaticGatewayConfigurationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Netlink = netlinkwrapper.NewNetLink()
-	r.NetNS = netnswrapper.NewNetNS()
-	r.IPTables = iptableswrapper.NewIPTables()
+	r.IPTables = utiliptables.New(utilexec.New(), utiliptables.ProtocolIPv4)
 	r.WgCtrl = wgctrlwrapper.NewWgCtrl()
 	controller, err := ctrl.NewControllerManagedBy(mgr).For(&egressgatewayv1alpha1.StaticGatewayConfiguration{}).Build(r)
 	if err != nil {
@@ -161,35 +162,25 @@ func (r *StaticGatewayConfigurationReconciler) reconcile(
 	}
 
 	// add lb ip (if not exists) to eth0
-	if err := r.reconcileIlbIPOnHost(ctx, gwConfig.Status.GatewayServerProfile.Ip, false /* deleting */); err != nil {
+	if err := r.reconcileIlbIPOnHost(ctx, gwConfig.Status.GatewayServerProfile.Ip); err != nil {
 		return err
 	}
 
-	// remove secondary ip from eth0
-	vmPrimaryIP, vmSecondaryIP, err := r.getVMIP(ctx, gwConfig)
+	// get vm primary IP and secondary IP
+	_, vmSecondaryIP, err := r.getVMIP(ctx, gwConfig)
 	if err != nil {
 		return err
 	}
-	if err := r.removeSecondaryIpFromHost(ctx, vmSecondaryIP); err != nil {
-		return err
-	}
 
-	// add iptables rule in host namespace
-	if err := r.addIPTablesRule(ctx, "-s", vmSecondaryIP+"/32",
-		"-m", "comment", "--comment", consts.IPTablesRuleComment+getGatewayNamespaceName(gwConfig),
-		"-j", "RETURN"); err != nil {
-		return err
-	}
-
-	// configure gateway namespace (if not exists)
-	if err := r.configureGatewayNamespace(ctx, gwConfig, privateKey, vmPrimaryIP, vmSecondaryIP); err != nil {
+	// configure gateway networking (if not exists)
+	if err := r.configureGatewayNetworking(ctx, gwConfig, privateKey, vmSecondaryIP); err != nil {
 		return err
 	}
 
 	// update gateway status
-	gwStatus := egressgatewayv1alpha1.GatewayNamespace{
+	gwStatus := egressgatewayv1alpha1.GatewayConfiguration{
 		StaticGatewayConfiguration: fmt.Sprintf("%s/%s", gwConfig.Namespace, gwConfig.Name),
-		NetnsName:                  getGatewayNamespaceName(gwConfig),
+		InterfaceName:              getWireguardLinkName(gwConfig),
 	}
 	if err := r.updateGatewayNodeStatus(ctx, gwStatus, true /* add */); err != nil {
 		return err
@@ -205,84 +196,104 @@ func (r *StaticGatewayConfigurationReconciler) reconcile(
 
 func (r *StaticGatewayConfigurationReconciler) cleanUp(ctx context.Context) error {
 	log := log.FromContext(ctx)
-	log.Info("Cleaning up orphaned network namespaces")
+	log.Info("Cleaning up orphaned gateway network configurations")
 
 	gwConfigList := &egressgatewayv1alpha1.StaticGatewayConfigurationList{}
 	if err := r.List(ctx, gwConfigList); err != nil {
 		return fmt.Errorf("failed to list staticGatewayConfigurations: %w", err)
 	}
-	existingNS := make(map[string]bool)
+
+	existingWgLinks := make(map[string]bool)
+	hasActiveGateway := false
 	for _, gwConfig := range gwConfigList.Items {
-		existingNS[getGatewayNamespaceName(&gwConfig)] = true
+		if applyToNode(&gwConfig) && gwConfig.GetDeletionTimestamp().IsZero() {
+			existingWgLinks[getWireguardLinkName(&gwConfig)] = true
+			hasActiveGateway = true
+		}
 	}
 
-	netnsList, err := r.NetNS.ListNS()
+	links, err := r.Netlink.LinkList()
 	if err != nil {
-		return fmt.Errorf("failed to list network namespaces: %w", err)
+		return fmt.Errorf("failed to list links: %w", err)
 	}
-	for _, netns := range netnsList {
-		if _, ok := existingNS[netns]; !ok && strings.HasPrefix(netns, "gw-") {
-			if err := r.ensureDeleted(ctx, netns); err != nil {
-				log.Error(err, fmt.Sprintf("failed to remove namespace %s", netns))
+
+	for _, link := range links {
+		if strings.HasPrefix(link.Attrs().Name, consts.WiregaurdLinkNamePrefix) && !existingWgLinks[link.Attrs().Name] {
+			log.Info("Cleaning up link", "link", link.Attrs().Name)
+
+			mark, err := getPacketMarkAndTableFromLinkName(link.Attrs().Name)
+			if err != nil {
+				log.Info("Failed to parse mark from link name", "link", link.Attrs().Name, "err", err)
+				continue
+			}
+			log.Info("Got mark and table from link", "link", link.Attrs().Name, "mark", mark)
+
+			// Delete routes
+			routes, err := r.Netlink.RouteListFiltered(nl.FAMILY_ALL, &netlink.Route{Table: mark}, netlink.RT_FILTER_TABLE)
+			if err != nil {
+				log.Info("Failed to list routes in table", "table", mark)
+			}
+			for _, route := range routes {
+				route := route
+				log.Info("Deleting route", "route", route)
+				if err := r.Netlink.RouteDel(&route); err != nil {
+					return fmt.Errorf("failed to delete route %s: %w", route, err)
+				}
+			}
+
+			// Delete ip rule
+			rules, err := r.Netlink.RuleList(nl.FAMILY_ALL)
+			if err != nil {
+				return fmt.Errorf("failed to list rules: %w", err)
+			}
+			for _, rule := range rules {
+				rule := rule
+				if rule.Mark == mark && rule.Table == mark {
+					log.Info("Deleting rule", "rule", rule)
+					if err := r.Netlink.RuleDel(&rule); err != nil {
+						return fmt.Errorf("failed to delete rule %s: %w", rule, err)
+					}
+				}
+			}
+
+			// Delete iptables rules
+			if err := r.removeIPTablesRule(ctx, link.Attrs().Name, mark); err != nil {
+				return fmt.Errorf("failed to delete iptables rules for link %s: %w", link.Attrs().Name, err)
+			}
+
+			// Delete wireguard link
+			log.Info("Deleting link", "link", link.Attrs().Name)
+			if err := r.Netlink.LinkDel(link); err != nil {
+				return fmt.Errorf("failed to delete link %s: %w", link.Attrs().Name, err)
+			}
+
+			// update gateway status
+			gwStatus := egressgatewayv1alpha1.GatewayConfiguration{
+				InterfaceName: link.Attrs().Name,
+			}
+			if err := r.updateGatewayNodeStatus(ctx, gwStatus, false /* add */); err != nil {
+				return err
+			}
+
+			if err := r.LBProbeServer.RemoveGateway(link.Attrs().Alias); err != nil {
+				return err
 			}
 		}
 	}
 
-	log.Info("Network namespace cleanup completed")
-	return nil
-}
-
-func (r *StaticGatewayConfigurationReconciler) ensureDeleted(ctx context.Context, netns string) error {
-	log := log.FromContext(ctx)
-
-	// remove lb ip (if exists and if it's the last network namespace) from eth0
-	netnsList, err := r.NetNS.ListNS()
-	if err != nil {
-		return fmt.Errorf("failed to list network namespace: %w", err)
-	}
-	exists := false
-	for _, ns := range netnsList {
-		if strings.HasPrefix(ns, "gw-") && ns != netns {
-			exists = true
-			break
+	// TODO: left overs: ilbIP, iptables jump rules in 3 tables
+	if !hasActiveGateway {
+		log.Info("No active gateway, cleaning up leftovers")
+		if err := r.reconcileIlbIPOnHost(ctx, ""); err != nil {
+			return fmt.Errorf("failed to clean up ilb ip on eth0: %w", err)
 		}
-	}
-	if !exists {
-		ilbIP := getILBIPFromNamespaceName(netns)
-		if err := r.reconcileIlbIPOnHost(ctx, ilbIP, true /* deleting */); err != nil {
-			return err
+
+		if err := r.removeLeftoverIPTablesRules(ctx); err != nil {
+			return fmt.Errorf("failed to clean up iptables rules: %w", err)
 		}
 	}
 
-	// delete iptables rule in host namespace
-	if err := r.removeIPTablesRule(ctx, netns); err != nil {
-		return err
-	}
-
-	// delete gateway namespace
-	gwns, err := r.NetNS.GetNS(netns)
-	if err == nil {
-		gwns.Close()
-		log.Info("Deleting network namespace", "namespace", netns)
-		if err := r.NetNS.UnmountNS(netns); err != nil {
-			return fmt.Errorf("failed to delete network namespace %s: %w", netns, err)
-		}
-	} else if _, ok := err.(ns.NSPathNotExistErr); !ok {
-		return fmt.Errorf("failed to get network namespace %s: %w", netns, err)
-	}
-
-	// update gateway status
-	gwStatus := egressgatewayv1alpha1.GatewayNamespace{
-		NetnsName: netns,
-	}
-	if err := r.updateGatewayNodeStatus(ctx, gwStatus, false /* add */); err != nil {
-		return err
-	}
-
-	gwUID := getGatewayUIDFromNamespaceName(netns)
-	if err := r.LBProbeServer.RemoveGateway(gwUID); err != nil {
-		return err
-	}
+	log.Info("Network configurations cleanup completed")
 	return nil
 }
 
@@ -405,7 +416,7 @@ func parseNodeTags() map[string]string {
 	return tags
 }
 
-func (r *StaticGatewayConfigurationReconciler) reconcileIlbIPOnHost(ctx context.Context, ilbIP string, deleting bool) error {
+func (r *StaticGatewayConfigurationReconciler) reconcileIlbIPOnHost(ctx context.Context, ilbIP string) error {
 	log := log.FromContext(ctx)
 	eth0, err := r.Netlink.LinkByName("eth0")
 	if err != nil {
@@ -420,15 +431,27 @@ func (r *StaticGatewayConfigurationReconciler) reconcileIlbIPOnHost(ctx context.
 		return fmt.Errorf("failed to retrieve and parse prefix: %w", err)
 	}
 
+	addresses, err := r.Netlink.AddrList(eth0, nl.FAMILY_ALL)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve IP addresses for eth0: %w", err)
+	}
+
+	if ilbIP == "" {
+		for _, address := range addresses {
+			if address.Label == consts.ILBIPLabel {
+				log.Info("Deleting ILB IP on eth0", "ilb ip", address.IPNet.String())
+				if err := r.Netlink.AddrDel(eth0, &address); err != nil {
+					return fmt.Errorf("failed to delete ILB IP from eth0: %w", err)
+				}
+			}
+		}
+		return nil
+	}
+
 	ilbIpCidr := fmt.Sprintf("%s/%d", ilbIP, prefix)
 	ilbIpNet, err := netlink.ParseIPNet(ilbIpCidr)
 	if err != nil {
 		return fmt.Errorf("failed to parse ILB IP address: %s", ilbIpCidr)
-	}
-
-	addresses, err := r.Netlink.AddrList(eth0, nl.FAMILY_ALL)
-	if err != nil {
-		return fmt.Errorf("failed to retrieve IP addresses for eth0: %w", err)
 	}
 
 	addressPresent := false
@@ -439,453 +462,437 @@ func (r *StaticGatewayConfigurationReconciler) reconcileIlbIPOnHost(ctx context.
 		}
 	}
 
-	if !addressPresent && !deleting {
+	if !addressPresent {
 		log.Info("Adding ILB IP to eth0", "ilb IP", ilbIpCidr)
 		if err := r.Netlink.AddrAdd(eth0, &netlink.Addr{
+			Label: consts.ILBIPLabel,
 			IPNet: ilbIpNet,
 		}); err != nil {
 			return fmt.Errorf("failed to add ILB IP to eth0: %w", err)
 		}
-	} else if addressPresent && deleting {
-		log.Info("Removing ILB IP from eth0", "ilb IP", ilbIpCidr)
-		if err := r.Netlink.AddrDel(eth0, &netlink.Addr{
-			IPNet: ilbIpNet,
-		}); err != nil {
-			return fmt.Errorf("failed to delete ILB IP from eth0: %w", err)
-		}
 	}
-
 	return nil
 }
 
-func (r *StaticGatewayConfigurationReconciler) removeSecondaryIpFromHost(ctx context.Context, ip string) error {
-	log := log.FromContext(ctx)
-	eth0, err := r.Netlink.LinkByName("eth0")
-	if err != nil {
-		return fmt.Errorf("failed to retrieve link eth0: %w", err)
-	}
-
-	addresses, err := r.Netlink.AddrList(eth0, nl.FAMILY_ALL)
-	if err != nil {
-		return fmt.Errorf("failed to retrieve IP addresses for eth0: %w", err)
-	}
-
-	for _, address := range addresses {
-		if address.IP.String() == ip {
-			log.Info("Removing secondary IP from eth0", "secondary_ip", address.IP.String())
-			if err := r.Netlink.AddrDel(eth0, &address); err != nil {
-				return fmt.Errorf("failed to remove secondary ip from eth0: %w", err)
-			}
-		}
-	}
-
-	return nil
-}
-
-func (r *StaticGatewayConfigurationReconciler) configureGatewayNamespace(
+func (r *StaticGatewayConfigurationReconciler) configureGatewayNetworking(
 	ctx context.Context,
 	gwConfig *egressgatewayv1alpha1.StaticGatewayConfiguration,
 	privateKey *wgtypes.Key,
-	vmPrimaryIP string,
 	vmSecondaryIP string,
 ) error {
-	log := log.FromContext(ctx)
+	if err := r.reconcileWireguardLink(ctx, gwConfig, privateKey); err != nil {
+		return err
+	}
 
-	gwNamespaceName := getGatewayNamespaceName(gwConfig)
-	gwns, err := r.NetNS.GetNS(gwNamespaceName)
+	if err := r.reconcileRouting(ctx, gwConfig); err != nil {
+		return err
+	}
+
+	if err := r.reconcileIPTables(ctx, gwConfig, vmSecondaryIP); err != nil {
+		return err
+	}
+	return nil
+}
+
+func getWireguardLinkName(gwConfig *egressgatewayv1alpha1.StaticGatewayConfiguration) string {
+	return consts.WiregaurdLinkNamePrefix + fmt.Sprintf("%d", gwConfig.Status.Port)
+}
+
+// getPacketMarkAndTable returns the packet mark and routing table number for each gwConfig.
+// the number starts from 0x8000 and since the current port range is 6000-7000, the number spans from 0x8000 to 0x83e8
+// the numbers in this range & 0x4000 == 0, which means they do not conflict with the packet mark used by kube-proxy
+func getPacketMarkAndTable(gwConfig *egressgatewayv1alpha1.StaticGatewayConfiguration) int {
+	return 0x8000 + int(gwConfig.Status.Port-consts.WireguardPortStart)
+}
+
+func getPacketMarkAndTableFromLinkName(wgLink string) (int, error) {
+	if !strings.HasPrefix(wgLink, consts.WiregaurdLinkNamePrefix) {
+		return -1, fmt.Errorf("invalid link name: %s", wgLink)
+	}
+	port, err := strconv.Atoi(strings.TrimPrefix(wgLink, consts.WiregaurdLinkNamePrefix))
 	if err != nil {
-		if _, ok := err.(ns.NSPathNotExistErr); ok {
-			log.Info("Creating new network namespace", "nsName", gwNamespaceName)
-			gwns, err = r.NetNS.NewNS(gwNamespaceName)
-			if err != nil {
-				return fmt.Errorf("failed to create network namespace %s: %w", gwNamespaceName, err)
-			}
-		} else {
-			return fmt.Errorf("failed to get network namespace %s: %w", gwNamespaceName, err)
-		}
+		return -1, fmt.Errorf("failed to parse port from link name: %s, err: %w", wgLink, err)
 	}
-	defer gwns.Close()
-
-	if err := r.reconcileWireguardLink(ctx, gwns, gwConfig, privateKey); err != nil {
-		return err
-	}
-
-	if err := r.reconcileVethPair(ctx, gwns, gwConfig, vmPrimaryIP, vmSecondaryIP); err != nil {
-		return err
-	}
-
-	return gwns.Do(func(nn ns.NetNS) error {
-		looplink, err := r.Netlink.LinkByName("lo")
-		if err != nil {
-			return fmt.Errorf("failed to retrieve link lo: %w", err)
-		}
-		if err := r.Netlink.LinkSetUp(looplink); err != nil {
-			return fmt.Errorf("failed to set lo up: %w", err)
-		}
-
-		if err := r.addIPTablesRule(ctx, "-o", consts.HostLinkName, "-j", "MASQUERADE"); err != nil {
-			return err
-		}
-		return nil
-	})
+	return 0x8000 + (port - int(consts.WireguardPortStart)), nil
 }
 
 func (r *StaticGatewayConfigurationReconciler) reconcileWireguardLink(
 	ctx context.Context,
-	gwns ns.NetNS,
 	gwConfig *egressgatewayv1alpha1.StaticGatewayConfiguration,
 	privateKey *wgtypes.Key,
 ) error {
 	log := log.FromContext(ctx)
 	var wgLink netlink.Link
 	var err error
-	if err = gwns.Do(func(nn ns.NetNS) error {
-		wgLink, err = r.Netlink.LinkByName(consts.WireguardLinkName)
-		if err != nil {
-			if _, ok := err.(netlink.LinkNotFoundError); !ok {
-				return fmt.Errorf("failed to get wireguard link in gateway namespace: %w", err)
-			}
-			wgLink = nil
+	wgName := getWireguardLinkName(gwConfig)
+
+	wgLink, err = r.Netlink.LinkByName(wgName)
+	if err != nil {
+		if _, ok := err.(netlink.LinkNotFoundError); !ok {
+			return fmt.Errorf("failed to get wireguard link %s: %w", wgName, err)
 		}
-		return nil
-	}); err != nil {
-		return err
+		wgLink = nil
 	}
 
 	if wgLink == nil {
 		log.Info("Creating wireguard link")
-		if err := r.createWireguardLink(gwns); err != nil {
-			return fmt.Errorf("failed to create wireguard link: %w", err)
+		attr := netlink.NewLinkAttrs()
+		attr.Name = wgName
+		attr.Alias = string(gwConfig.GetUID())
+		if err := r.Netlink.LinkAdd(&netlink.Wireguard{LinkAttrs: attr}); err != nil {
+			return fmt.Errorf("failed to create wireguard link %s: %w", wgName, err)
+		}
+		wgLink, err = r.Netlink.LinkByName(wgName)
+		if err != nil {
+			return fmt.Errorf("failed to get wireguard link %s after creation: %w", wgName, err)
 		}
 	}
 
-	return gwns.Do(func(nn ns.NetNS) error {
-		wgLink, err := r.Netlink.LinkByName(consts.WireguardLinkName)
-		if err != nil {
-			return fmt.Errorf("failed to get wireguard link in gateway namespace after creation: %w", err)
-		}
-		gwIP, _ := netlink.ParseIPNet(consts.GatewayIP)
-		gwLinkAddr := netlink.Addr{
-			IPNet: gwIP,
-		}
+	gwIP, _ := netlink.ParseIPNet(consts.GatewayIP)
+	gwLinkAddr := netlink.Addr{
+		IPNet: gwIP,
+	}
 
-		wgLinkAddrs, err := r.Netlink.AddrList(wgLink, nl.FAMILY_ALL)
-		if err != nil {
-			return fmt.Errorf("failed to retrieve address list from wireguard link: %w", err)
-		}
-
-		foundLink := false
-		for _, addr := range wgLinkAddrs {
-			if addr.Equal(gwLinkAddr) {
-				log.Info("Found wireguard link address")
-				foundLink = true
-				break
-			}
-		}
-
-		if !foundLink {
-			log.Info("Adding wireguard link address")
-			err = r.Netlink.AddrAdd(wgLink, &gwLinkAddr)
-			if err != nil {
-				return fmt.Errorf("failed to add wireguard link address: %w", err)
-			}
-		}
-
-		err = r.Netlink.LinkSetUp(wgLink)
-		if err != nil {
-			return fmt.Errorf("failed to set wireguard link up: %w", err)
-		}
-
-		wgClient, err := r.WgCtrl.New()
-		if err != nil {
-			return fmt.Errorf("failed to create wgctrl client: %w", err)
-		}
-		defer func() { _ = wgClient.Close() }()
-
-		wgConfig := wgtypes.Config{
-			ListenPort: to.Ptr(int(gwConfig.Status.Port)),
-			PrivateKey: privateKey,
-		}
-
-		device, err := wgClient.Device(consts.WireguardLinkName)
-		if err != nil {
-			return fmt.Errorf("failed to get wireguard link configuration: %w", err)
-		}
-
-		if device.PrivateKey.String() != wgConfig.PrivateKey.String() || device.ListenPort != to.Val(wgConfig.ListenPort) {
-			log.Info("Updating wireguard link config", "orig port", device.ListenPort, "cur port", to.Val(wgConfig.ListenPort),
-				"private key difference", device.PrivateKey.String() != wgConfig.PrivateKey.String())
-			err = wgClient.ConfigureDevice(consts.WireguardLinkName, wgConfig)
-			if err != nil {
-				return fmt.Errorf("failed to add peer to wireguard link: %w", err)
-			}
-		}
-		return nil
-	})
-}
-
-func (r *StaticGatewayConfigurationReconciler) createWireguardLink(gwns ns.NetNS) error {
-	succeed := false
-	attr := netlink.NewLinkAttrs()
-	attr.Name = consts.WireguardLinkName
-	wg := &netlink.Wireguard{LinkAttrs: attr}
-	err := r.Netlink.LinkAdd(wg)
+	wgLinkAddrs, err := r.Netlink.AddrList(wgLink, nl.FAMILY_ALL)
 	if err != nil {
-		return fmt.Errorf("failed to create wireguard link: %w", err)
+		return fmt.Errorf("failed to retrieve address list from wireguard link %s: %w", wgName, err)
 	}
-	defer func() {
-		if !succeed {
-			_ = r.Netlink.LinkDel(wg)
+
+	foundLink := false
+	for _, addr := range wgLinkAddrs {
+		if addr.Equal(gwLinkAddr) {
+			log.Info("Found wireguard link address")
+			foundLink = true
+			break
 		}
-	}()
+	}
 
-	wgLink, err := r.Netlink.LinkByName(consts.WireguardLinkName)
+	if !foundLink {
+		log.Info("Adding wireguard link address")
+		if err := r.Netlink.AddrAdd(wgLink, &gwLinkAddr); err != nil {
+			return fmt.Errorf("failed to add wireguard link address on %s: %w", wgName, err)
+		}
+	}
+
+	if err := r.Netlink.LinkSetUp(wgLink); err != nil {
+		return fmt.Errorf("failed to set wireguard link %s up: %w", wgName, err)
+	}
+
+	wgClient, err := r.WgCtrl.New()
 	if err != nil {
-		return fmt.Errorf("failed to get wireguard link in host namespace: %w", err)
+		return fmt.Errorf("failed to create wgctrl client: %w", err)
+	}
+	defer func() { _ = wgClient.Close() }()
+
+	wgConfig := wgtypes.Config{
+		ListenPort: to.Ptr(int(gwConfig.Status.Port)),
+		PrivateKey: privateKey,
 	}
 
-	if err := r.Netlink.LinkSetNsFd(wgLink, int(gwns.Fd())); err != nil {
-		return fmt.Errorf("failed to move wireguard link to gateway namespace: %w", err)
+	device, err := wgClient.Device(wgName)
+	if err != nil {
+		return fmt.Errorf("failed to get wireguard link configuration for %s: %w", wgName, err)
 	}
 
-	succeed = true
+	if device.PrivateKey.String() != wgConfig.PrivateKey.String() || device.ListenPort != to.Val(wgConfig.ListenPort) {
+		log.Info("Updating wireguard link config", "link name", wgName, "orig port", device.ListenPort, "cur port", to.Val(wgConfig.ListenPort),
+			"private key difference", device.PrivateKey.String() != wgConfig.PrivateKey.String())
+		err = wgClient.ConfigureDevice(wgName, wgConfig)
+		if err != nil {
+			return fmt.Errorf("failed to setup wireguard link %s: %w", wgLink, err)
+		}
+	}
 	return nil
 }
 
-func (r *StaticGatewayConfigurationReconciler) reconcileVethPair(
+func (r *StaticGatewayConfigurationReconciler) reconcileRouting(
 	ctx context.Context,
-	gwns ns.NetNS,
 	gwConfig *egressgatewayv1alpha1.StaticGatewayConfiguration,
-	vmPrimaryIP string,
+) error {
+	log := log.FromContext(ctx)
+	eth0, err := r.Netlink.LinkByName("eth0")
+	if err != nil {
+		return fmt.Errorf("failed to retrieve link eth0: %w", err)
+	}
+	routes, err := r.Netlink.RouteList(eth0, nl.FAMILY_ALL)
+	if err != nil {
+		return fmt.Errorf("failed to list routes from eth0: %w", err)
+	}
+
+	var defaultGW net.IP
+	for _, route := range routes {
+		if route.Dst == nil {
+			defaultGW = route.Gw
+		}
+	}
+
+	tablemark := getPacketMarkAndTable(gwConfig)
+	route := &netlink.Route{
+		LinkIndex: eth0.Attrs().Index,
+		Dst:       nil,
+		Gw:        defaultGW,
+		Table:     tablemark,
+	}
+	if err := r.Netlink.RouteReplace(route); err != nil {
+		return fmt.Errorf("failed to create default route via eth0 in table %d: %w", tablemark, err)
+	}
+
+	rule := netlink.NewRule()
+	rule.Mark = tablemark
+	rule.Table = tablemark
+	rules, err := r.Netlink.RuleList(nl.FAMILY_ALL)
+	if err != nil {
+		return fmt.Errorf("failed to list rules: %w", err)
+	}
+	foundRule := false
+	for _, r := range rules {
+		if r.Mark == rule.Mark && r.Table == rule.Table {
+			foundRule = true
+			break
+		}
+	}
+	if !foundRule {
+		log.Info("Adding rule", "fwmark", rule.Mark, "table", rule.Table)
+		if err := r.Netlink.RuleAdd(rule); err != nil {
+			return fmt.Errorf("failed to add rule (fwmark %d table %d): %w", tablemark, tablemark, err)
+		}
+	}
+	return nil
+}
+
+func (r *StaticGatewayConfigurationReconciler) reconcileIPTables(
+	ctx context.Context,
+	gwConfig *egressgatewayv1alpha1.StaticGatewayConfiguration,
 	vmSecondaryIP string,
 ) error {
 	log := log.FromContext(ctx)
-	if err := r.reconcileVethPairInHost(ctx, gwns, gwConfig, vmSecondaryIP); err != nil {
-		return fmt.Errorf("failed to reconcile veth pair in host namespace: %w", err)
-	}
 
-	return gwns.Do(func(nn ns.NetNS) error {
-		hostLink, err := r.Netlink.LinkByName(consts.HostLinkName)
-		if err != nil {
-			return fmt.Errorf("failed to get host link in gateway namespace: %w", err)
-		}
-
-		_, snatIPNet, err := net.ParseCIDR(vmSecondaryIP + "/32")
-		if err != nil {
-			return fmt.Errorf("failed to parse SNAT IP(%s) for host interface: %w", vmSecondaryIP+"/32", err)
-		}
-		hostLinkAddr := netlink.Addr{IPNet: snatIPNet}
-
-		hostLinkAddrs, err := r.Netlink.AddrList(hostLink, nl.FAMILY_ALL)
-		if err != nil {
-			return fmt.Errorf("failed to retrieve address list from wireguard link: %w", err)
-		}
-
-		foundLink := false
-		for _, addr := range hostLinkAddrs {
-			if addr.Equal(hostLinkAddr) {
-				log.Info("Found host link address in gateway namespace")
-				foundLink = true
-				break
-			}
-		}
-
-		if !foundLink {
-			log.Info("Adding host link address in gateway namespace")
-			err = r.Netlink.AddrReplace(hostLink, &hostLinkAddr)
-			if err != nil {
-				return fmt.Errorf("failed to add host link address in gateway namespace: %w", err)
-			}
-		}
-
-		err = r.Netlink.LinkSetUp(hostLink)
-		if err != nil {
-			return fmt.Errorf("failed to set host link up: %w", err)
-		}
-
-		_, vmSnatCidr, err := net.ParseCIDR(vmPrimaryIP + "/32")
-		if err != nil {
-			return fmt.Errorf("failed to parse CIDR %s/32: %w", vmPrimaryIP+"/32", err)
-		}
-
-		err = r.addOrReplaceRoute(ctx, &netlink.Route{
-			LinkIndex: hostLink.Attrs().Index,
-			Scope:     netlink.SCOPE_LINK,
-			Dst:       vmSnatCidr,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to create route to VM primary IP %s via gateway interface: %w", vmPrimaryIP, err)
-		}
-
-		err = r.addOrReplaceRoute(ctx, &netlink.Route{
-			LinkIndex: hostLink.Attrs().Index,
-			Scope:     netlink.SCOPE_UNIVERSE,
-			Dst:       nil,
-			Gw:        net.ParseIP(vmPrimaryIP),
-		})
-		if err != nil {
-			return fmt.Errorf("failed to create default route via %s: %w", vmPrimaryIP, err)
-		}
-		return nil
-	})
-}
-
-func (r *StaticGatewayConfigurationReconciler) reconcileVethPairInHost(
-	ctx context.Context,
-	gwns ns.NetNS,
-	gwConfig *egressgatewayv1alpha1.StaticGatewayConfiguration,
-	snatIP string,
-) error {
-	log := log.FromContext(ctx)
-	succeed := false
-
-	la := netlink.NewLinkAttrs()
-	la.Name = getVethHostLinkName(gwConfig)
-
-	mainLink, err := r.Netlink.LinkByName(la.Name)
-	if _, ok := err.(netlink.LinkNotFoundError); ok {
-		log.Info("Creating veth pair in host namespace")
-		veth := &netlink.Veth{
-			LinkAttrs: la,
-			PeerName:  consts.HostLinkName,
-		}
-		err := r.Netlink.LinkAdd(veth)
-		if err != nil {
-			return fmt.Errorf("failed to add veth pair: %w", err)
-		}
-		defer func() {
-			if !succeed {
-				_ = r.Netlink.LinkDel(veth)
-			}
-		}()
-		mainLink, err = r.Netlink.LinkByName(la.Name)
-		if err != nil {
-			return fmt.Errorf("failed to get veth link in host namespace after creation: %w", err)
-		}
-	} else if err != nil {
-		return fmt.Errorf("failed to get veth link in host namespace: %w", err)
-	}
-
-	err = r.Netlink.LinkSetUp(mainLink)
-	if err != nil {
-		return fmt.Errorf("failed to set veth link in host namespace up: %w", err)
-	}
-
-	_, snatIPNet, err := net.ParseCIDR(snatIP + "/32")
-	if err != nil {
-		return fmt.Errorf("failed to parse SNAT IP %s: %w", snatIP+"/32", err)
-	}
-	route := &netlink.Route{
-		LinkIndex: mainLink.Attrs().Index,
-		Scope:     netlink.SCOPE_UNIVERSE,
-		Dst:       snatIPNet,
-	}
-	if err = r.addOrReplaceRoute(ctx, route); err != nil {
-		return fmt.Errorf("failed to create route to SNAT IP %s via gateway interface: %w", snatIP, err)
-	}
-	defer func() {
-		if !succeed {
-			_ = r.Netlink.RouteDel(route)
-		}
-	}()
-
-	hostLink, err := r.Netlink.LinkByName(consts.HostLinkName)
-	if err == nil {
-		if err := r.Netlink.LinkSetNsFd(hostLink, int(gwns.Fd())); err != nil {
-			return fmt.Errorf("failed to move veth peer link to gateway namespace: %w", err)
-		}
-	} else if _, ok := err.(netlink.LinkNotFoundError); !ok {
-		return fmt.Errorf("failed to get veth peer link in host namespace: %w", err)
-	}
-
-	succeed = true
-	return nil
-}
-
-func (r *StaticGatewayConfigurationReconciler) addOrReplaceRoute(ctx context.Context, route *netlink.Route) error {
-	log := log.FromContext(ctx)
-	equalRoute := func(r1, r2 *netlink.Route) bool {
-		size1, _ := to.Val(r1.Dst).Mask.Size()
-		size2, _ := to.Val(r2.Dst).Mask.Size()
-		return r1.LinkIndex == r2.LinkIndex && r1.Scope == r2.Scope &&
-			to.Val(r1.Dst).IP.Equal(to.Val(r2.Dst).IP) && size1 == size2 && r1.Gw.Equal(r2.Gw)
-	}
-	routes, err := r.Netlink.RouteList(nil, nl.FAMILY_ALL)
-	if err != nil {
+	log.Info("Ensuring iptables rules in filter table")
+	if err := r.ensureIPTablesChain(
+		ctx,
+		utiliptables.TableFilter, // table name
+		utiliptables.Chain("EGRESS-GATEWAY-ALLOW-FORWARD"),                        // target chain
+		utiliptables.ChainForward,                                                 // source chain
+		"kube-egress-gateway allow packets fowarded from/to wireguard interfaces", // jump rule comment
+		[][]string{
+			{"-i", "wg+", "-o", "eth0", "-j", "ACCEPT"},
+			{"-i", "eth0", "-o", "wg+", "-j", "ACCEPT"},
+		}); err != nil {
 		return err
 	}
-	foundRoute := false
-	for i := range routes {
-		if equalRoute(&routes[i], route) {
-			foundRoute = true
-		}
+
+	log.Info("Ensuring iptables rules in mangle table")
+	if err := r.ensureIPTablesChain(
+		ctx,
+		utiliptables.TableMangle, // table name
+		utiliptables.Chain("EGRESS-GATEWAY-MARK"),                    // target chain
+		utiliptables.ChainPrerouting,                                 // source chain
+		"kube-egress-gateway mark packets from wireguard interfaces", // jump rule comment
+		nil); err != nil {
+		return err
 	}
-	if !foundRoute {
-		log.Info("Adding new route", "route", *route)
-		if err = r.Netlink.RouteReplace(route); err != nil {
-			return err
-		}
+
+	mark := getPacketMarkAndTable(gwConfig)
+	gwLink := getWireguardLinkName(gwConfig)
+	if err := r.ensureIPTablesChain(
+		ctx,
+		utiliptables.TableMangle, // table name
+		utiliptables.Chain(fmt.Sprintf("EGRESS-GATEWAY-MARK-0X%04X", mark)),         // target chain
+		utiliptables.Chain("EGRESS-GATEWAY-MARK"),                                   // source chain
+		fmt.Sprintf("kube-egress-gateway mark packets for gateway link %s", gwLink), // jump rule comment
+		[][]string{
+			{"-i", gwLink, "-j", "MARK", "--set-mark", fmt.Sprintf("%d", mark)},
+			{"-i", gwLink, "-j", "CONNMARK", "--save-mark"},
+			{"-i", gwLink, "-j", "ACCEPT"},
+			{"-i", "eth0", "-m", "connmark", "--mark", fmt.Sprintf("%d", mark), "-j", "CONNMARK", "--restore-mark"},
+		}); err != nil {
+		return err
+	}
+
+	log.Info("Ensuring iptables rules in nat table")
+	if err := r.ensureIPTablesChain(
+		ctx,
+		utiliptables.TableNAT, // table name
+		utiliptables.Chain("EGRESS-GATEWAY-SNAT"),                    // target chain
+		utiliptables.ChainPostrouting,                                // source chain
+		"kube-egress-gateway SNAT packets from wireguard interfaces", // jump rule comment
+		nil); err != nil {
+		return err
+	}
+
+	if err := r.ensureIPTablesChain(
+		ctx,
+		utiliptables.TableNAT, // table name
+		utiliptables.Chain(fmt.Sprintf("EGRESS-GATEWAY-SNAT-0X%04X", mark)),         // target chain
+		utiliptables.Chain("EGRESS-GATEWAY-SNAT"),                                   // source chain
+		fmt.Sprintf("kube-egress-gateway sNAT packets for gateway link %s", gwLink), // jump rule comment
+		[][]string{
+			{"-o", "eth0", "-m", "connmark", "--mark", fmt.Sprintf("%d", mark), "-j", "SNAT", "--to-source", vmSecondaryIP}, // not sure why, but -m mark --mark does not work...
+		}); err != nil {
+		return err
 	}
 	return nil
 }
 
-func (r *StaticGatewayConfigurationReconciler) addIPTablesRule(ctx context.Context, rulespec ...string) error {
+func (r *StaticGatewayConfigurationReconciler) removeIPTablesRule(
+	ctx context.Context,
+	linkName string,
+	mark int,
+) error {
+	// delete iptables chain in mangle table
+	if err := r.removeIPTablesChain(
+		ctx,
+		utiliptables.TableMangle, // table name
+		utiliptables.Chain(fmt.Sprintf("EGRESS-GATEWAY-MARK-0X%04X", mark)),           // target chain
+		utiliptables.Chain("EGRESS-GATEWAY-MARK"),                                     // source chain
+		fmt.Sprintf("kube-egress-gateway mark packets for gateway link %s", linkName), // jump rule comment
+	); err != nil {
+		return err
+	}
+
+	// delete iptables chain in nat table
+	if err := r.removeIPTablesChain(
+		ctx,
+		utiliptables.TableNAT, // table name
+		utiliptables.Chain(fmt.Sprintf("EGRESS-GATEWAY-SNAT-0X%04X", mark)),           // target chain
+		utiliptables.Chain("EGRESS-GATEWAY-SNAT"),                                     // source chain
+		fmt.Sprintf("kube-egress-gateway sNAT packets for gateway link %s", linkName), // jump rule comment
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *StaticGatewayConfigurationReconciler) removeLeftoverIPTablesRules(ctx context.Context) error {
+	// delete iptables chain in filter table
+	if err := r.removeIPTablesChain(
+		ctx,
+		utiliptables.TableFilter, // table name
+		utiliptables.Chain("EGRESS-GATEWAY-ALLOW-FORWARD"),                        // target chain
+		utiliptables.ChainForward,                                                 // source chain
+		"kube-egress-gateway allow packets fowarded from/to wireguard interfaces", // jump rule comment
+	); err != nil {
+		return err
+	}
+
+	// delete iptables chain in mangle table
+	if err := r.removeIPTablesChain(
+		ctx,
+		utiliptables.TableMangle, // table name
+		utiliptables.Chain("EGRESS-GATEWAY-MARK"),                    // target chain
+		utiliptables.ChainPrerouting,                                 // source chain
+		"kube-egress-gateway mark packets from wireguard interfaces", // jump rule comment
+	); err != nil {
+		return err
+	}
+
+	// delete iptables chain in nat table
+	if err := r.removeIPTablesChain(
+		ctx,
+		utiliptables.TableNAT, // table name
+		utiliptables.Chain("EGRESS-GATEWAY-SNAT"),                    // target chain
+		utiliptables.ChainPostrouting,                                // source chain
+		"kube-egress-gateway SNAT packets from wireguard interfaces", // jump rule comment
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *StaticGatewayConfigurationReconciler) ensureIPTablesChain(
+	ctx context.Context,
+	table utiliptables.Table,
+	targetChain utiliptables.Chain,
+	sourceChain utiliptables.Chain,
+	jumpRuleComment string,
+	chainRules [][]string,
+) error {
 	log := log.FromContext(ctx)
-	ipt, err := r.IPTables.New()
-	if err != nil {
-		return fmt.Errorf("failed to get iptable: %w", err)
+
+	// ensure target chain exists
+	log.Info("Ensuring iptables chain", "table", table, "target chain", targetChain)
+	if _, err := r.IPTables.EnsureChain(table, targetChain); err != nil {
+		return fmt.Errorf("failed to ensure chain %s in table %s: %w", targetChain, table, err)
 	}
 
-	log.Info(fmt.Sprintf("Checking rule(%v) existence in nat table POSTROUTING chain", rulespec))
-	exists, err := ipt.Exists(consts.NatTable, consts.PostRoutingChain, rulespec...)
-	if err != nil {
-		return fmt.Errorf("failed to check existence of iptables rule: %w", err)
+	// ensure jump rule exists, we use EnsureRule because we do not want to flush all rules in the source chain
+	log.Info("Ensuring jump rule", "source chain", sourceChain)
+	if _, err := r.IPTables.EnsureRule(utiliptables.Prepend, table, sourceChain, "-m", "comment", "--comment", jumpRuleComment, "-j", string(targetChain)); err != nil {
+		return fmt.Errorf("failed to ensure jump rule from chain %s to chain %s in table %s: %w", sourceChain, targetChain, table, err)
 	}
 
-	if !exists {
-		log.Info("Inserting rule at the beginning of nat table POSTROUTING chain")
-		if err := ipt.Insert(consts.NatTable, consts.PostRoutingChain, 1, rulespec...); err != nil {
-			return fmt.Errorf("failed to create iptables rule: %w", err)
-		}
+	if len(chainRules) == 0 {
+		return nil
+	}
+
+	// ensure all rules in the target chain atomically
+	lines := bytes.NewBuffer(nil)
+	writeLine(lines, "*"+string(table))
+	writeLine(lines, utiliptables.MakeChainLine(targetChain))
+	for _, rule := range chainRules {
+		writeRule(lines, string(utiliptables.Append), targetChain, rule...)
+	}
+	writeLine(lines, "COMMIT")
+	log.Info("Restoring rules", "rules", lines.String())
+	if err := r.IPTables.RestoreAll(lines.Bytes(), utiliptables.NoFlushTables, utiliptables.NoRestoreCounters); err != nil {
+		return fmt.Errorf("failed to restore rules in chain %s in table %s: %w", targetChain, table, err)
 	}
 	return nil
 }
 
-func (r *StaticGatewayConfigurationReconciler) removeIPTablesRule(ctx context.Context, netns string) error {
+func (r *StaticGatewayConfigurationReconciler) removeIPTablesChain(
+	ctx context.Context,
+	table utiliptables.Table,
+	targetChain utiliptables.Chain,
+	sourceChain utiliptables.Chain,
+	jumpRuleComment string,
+) error {
 	log := log.FromContext(ctx)
-	ipt, err := r.IPTables.New()
-	if err != nil {
-		return fmt.Errorf("failed to get iptable: %w", err)
+
+	iptablesData := bytes.NewBuffer(nil)
+	if err := r.IPTables.SaveInto(table, iptablesData); err != nil {
+		return fmt.Errorf("failed to run iptables-save: %w", err)
 	}
 
-	rules, err := ipt.List(consts.NatTable, consts.PostRoutingChain)
-	if err != nil {
-		return fmt.Errorf("failed to list rules in nat table POSTROUTING chain: %w", err)
-	}
+	existingChains := utiliptables.GetChainsFromTable(iptablesData.Bytes())
+	if _, ok := existingChains[targetChain]; ok {
+		// delete jump rule first
+		log.Info("Deleting jump rule", "source chain", sourceChain, "target chain", targetChain)
+		if err := r.IPTables.DeleteRule(table, sourceChain, "-m", "comment", "--comment", jumpRuleComment, "-j", string(targetChain)); err != nil {
+			return fmt.Errorf("failed to delete jump rule from chain %s to chain %s in table %s: %w", sourceChain, targetChain, table, err)
+		}
 
-	for _, rule := range rules {
-		if strings.Contains(rule, netns) {
-			ruleSpec := strings.Split(rule, " ")
-			for i, spec := range ruleSpec {
-				if spec == "-s" {
-					srcIP := ruleSpec[i+1]
-					log.Info(fmt.Sprintf("Deleting rule(%s) from nat table POSTROUTING chain", rule))
-					if err := ipt.Delete(consts.NatTable, consts.PostRoutingChain, "-s", srcIP,
-						"-m", "comment", "--comment", consts.IPTablesRuleComment+netns,
-						"-j", "RETURN"); err != nil {
-						return fmt.Errorf("failed to delete iptables rule: %w", err)
-					}
-					break
-				}
-			}
+		log.Info("Flushing and deleting chain", "table", table, "target chain", targetChain)
+		lines := bytes.NewBuffer(nil)
+		writeLine(lines, "*"+string(table))
+		writeLine(lines, utiliptables.MakeChainLine(targetChain))
+		writeLine(lines, "-X", string(targetChain))
+		writeLine(lines, "COMMIT")
+		if err := r.IPTables.Restore(table, lines.Bytes(), utiliptables.NoFlushTables, utiliptables.NoRestoreCounters); err != nil {
+			return fmt.Errorf("failed to restore rules in chain %s in table %s: %w", targetChain, table, err)
 		}
 	}
+
 	return nil
+}
+
+// Similar syntax to utiliptables.Interface.EnsureRule, except you don't pass a table
+// (you must write these rules under the line with the table name)
+func writeRule(lines *bytes.Buffer, position string, chain utiliptables.Chain, args ...string) {
+	fullArgs := append([]string{position, string(chain)}, args...)
+	writeLine(lines, fullArgs...)
+}
+
+// Join all words with spaces, terminate with newline and write to buf.
+func writeLine(lines *bytes.Buffer, words ...string) {
+	lines.WriteString(strings.Join(words, " ") + "\n")
 }
 
 func (r *StaticGatewayConfigurationReconciler) updateGatewayNodeStatus(
 	ctx context.Context,
-	gwNamespace egressgatewayv1alpha1.GatewayNamespace,
+	gwConfig egressgatewayv1alpha1.GatewayConfiguration,
 	add bool,
 ) error {
 	log := log.FromContext(ctx)
@@ -919,7 +926,7 @@ func (r *StaticGatewayConfigurationReconciler) updateGatewayNodeStatus(
 					Namespace: gwStatusKey.Namespace,
 				},
 				Spec: egressgatewayv1alpha1.GatewayStatusSpec{
-					ReadyGatewayNamespaces: []egressgatewayv1alpha1.GatewayNamespace{gwNamespace},
+					ReadyGatewayConfigurations: []egressgatewayv1alpha1.GatewayConfiguration{gwConfig},
 				},
 			}
 			if err := controllerutil.SetOwnerReference(node, gwStatus, r.Client.Scheme()); err != nil {
@@ -933,23 +940,23 @@ func (r *StaticGatewayConfigurationReconciler) updateGatewayNodeStatus(
 	} else {
 		changed := false
 		found := false
-		for i, gwns := range gwStatus.Spec.ReadyGatewayNamespaces {
-			if gwns.NetnsName == gwNamespace.NetnsName {
+		for i, gwConf := range gwStatus.Spec.ReadyGatewayConfigurations {
+			if gwConf.InterfaceName == gwConfig.InterfaceName {
 				if !add {
 					changed = true
-					gwStatus.Spec.ReadyGatewayNamespaces = append(gwStatus.Spec.ReadyGatewayNamespaces[:i], gwStatus.Spec.ReadyGatewayNamespaces[i+1:]...)
+					gwStatus.Spec.ReadyGatewayConfigurations = append(gwStatus.Spec.ReadyGatewayConfigurations[:i], gwStatus.Spec.ReadyGatewayConfigurations[i+1:]...)
 				}
 				found = true
 				break
 			}
 		}
 		if add && !found {
-			gwStatus.Spec.ReadyGatewayNamespaces = append(gwStatus.Spec.ReadyGatewayNamespaces, gwNamespace)
+			gwStatus.Spec.ReadyGatewayConfigurations = append(gwStatus.Spec.ReadyGatewayConfigurations, gwConfig)
 			changed = true
 		}
 		if !add {
 			for i := len(gwStatus.Spec.ReadyPeerConfigurations) - 1; i >= 0; i = i - 1 {
-				if gwStatus.Spec.ReadyPeerConfigurations[i].NetnsName == gwNamespace.NetnsName {
+				if gwStatus.Spec.ReadyPeerConfigurations[i].InterfaceName == gwConfig.InterfaceName {
 					changed = true
 					gwStatus.Spec.ReadyPeerConfigurations = append(gwStatus.Spec.ReadyPeerConfigurations[:i], gwStatus.Spec.ReadyPeerConfigurations[i+1:]...)
 				}
@@ -963,21 +970,4 @@ func (r *StaticGatewayConfigurationReconciler) updateGatewayNodeStatus(
 		}
 	}
 	return nil
-}
-
-func getGatewayNamespaceName(gwConfig *egressgatewayv1alpha1.StaticGatewayConfiguration) string {
-	return fmt.Sprintf("gw-%s-%s", string(gwConfig.GetUID()), strings.Replace(gwConfig.Status.GatewayServerProfile.Ip, ".", "_", -1))
-}
-
-func getVethHostLinkName(gwConfig *egressgatewayv1alpha1.StaticGatewayConfiguration) string {
-	nsName := getGatewayNamespaceName(gwConfig)
-	return nsName[:11]
-}
-
-func getGatewayUIDFromNamespaceName(netns string) string {
-	return netns[strings.Index(netns, "-")+1 : strings.LastIndex(netns, "-")]
-}
-
-func getILBIPFromNamespaceName(netns string) string {
-	return strings.Replace(netns[strings.LastIndex(netns, "-")+1:], "_", ".", -1)
 }

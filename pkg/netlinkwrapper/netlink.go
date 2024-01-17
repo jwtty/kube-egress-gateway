@@ -9,6 +9,8 @@ type Interface interface {
 	LinkByName(name string) (netlink.Link, error)
 	// LinkAdd adds a new link device
 	LinkAdd(link netlink.Link) error
+	// LinkList lists link devices
+	LinkList() ([]netlink.Link, error)
 	// LinkDel deletes link device
 	LinkDel(link netlink.Link) error
 	// LinkSetUp enables the link device
@@ -35,8 +37,14 @@ type Interface interface {
 	RouteDel(route *netlink.Route) error
 	// RouteList gets a list of routes in the system
 	RouteList(link netlink.Link, family int) ([]netlink.Route, error)
+	// RouteListFiltered gets a list of routes in the system filtered with specified rules.
+	RouteListFiltered(family int, filter *netlink.Route, filterMask uint64) ([]netlink.Route, error)
 	// RuleAdd adds a rule
 	RuleAdd(rule *netlink.Rule) error
+	// RuleList lists ip rules
+	RuleList(family int) ([]netlink.Rule, error)
+	// RuleDel deletes a rule
+	RuleDel(rule *netlink.Rule) error
 }
 
 type nl struct{}
@@ -51,6 +59,10 @@ func (*nl) LinkByName(name string) (netlink.Link, error) {
 
 func (*nl) LinkAdd(link netlink.Link) error {
 	return netlink.LinkAdd(link)
+}
+
+func (*nl) LinkList() ([]netlink.Link, error) {
+	return netlink.LinkList()
 }
 
 func (*nl) LinkDel(link netlink.Link) error {
@@ -105,6 +117,18 @@ func (*nl) RouteList(link netlink.Link, family int) ([]netlink.Route, error) {
 	return netlink.RouteList(link, family)
 }
 
+func (*nl) RouteListFiltered(family int, filter *netlink.Route, filterMask uint64) ([]netlink.Route, error) {
+	return netlink.RouteListFiltered(family, filter, filterMask)
+}
+
 func (*nl) RuleAdd(rule *netlink.Rule) error {
 	return netlink.RuleAdd(rule)
+}
+
+func (*nl) RuleList(family int) ([]netlink.Rule, error) {
+	return netlink.RuleList(family)
+}
+
+func (*nl) RuleDel(rule *netlink.Rule) error {
+	return netlink.RuleDel(rule)
 }

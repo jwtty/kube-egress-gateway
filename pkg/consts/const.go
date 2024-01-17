@@ -44,11 +44,11 @@ const (
 )
 
 const (
-	// wireguard link name in gateway namespace
+	// wireguard link name in pod namespace
 	WireguardLinkName = "wg0"
 
-	// host link name in gateway namespace
-	HostLinkName = "host0"
+	// wireguard link name prefix on gateway node
+	WiregaurdLinkNamePrefix = "wg"
 
 	// gateway IP
 	GatewayIP = "fe80::1/64"
@@ -74,11 +74,11 @@ const (
 	// environment variable name for nodeName
 	NodeNameEnvKey = "MY_NODE_NAME"
 
-	// iptables rule comment
-	IPTablesRuleComment = "no SNAT for traffic from netns "
-
 	// mark for traffic from eth0 in pod namespace - 0x2222
 	Eth0Mark int = 8738
+
+	// ilb ip address label
+	ILBIPLabel = "eth0:egress"
 )
 
 const (
